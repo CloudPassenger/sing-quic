@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/quic-go"
@@ -55,6 +56,20 @@ type ServerHandler interface {
 	N.UDPConnectionHandlerEx
 }
 
+// UserState is an immutable password-to-user authentication snapshot.
+type UserState[U comparable] struct {
+	userMap map[string]U
+}
+
+// NewUserState compiles a complete authentication snapshot without publishing it.
+func NewUserState[U comparable](userList []U, passwordList []string) *UserState[U] {
+	userMap := make(map[string]U, len(userList))
+	for index, user := range userList {
+		userMap[passwordList[index]] = user
+	}
+	return &UserState[U]{userMap: userMap}
+}
+
 type Service[U comparable] struct {
 	ctx                   context.Context
 	logger                logger.Logger
@@ -68,7 +83,7 @@ type Service[U comparable] struct {
 	geckoMaxPacketSize    int
 	tlsConfig             aTLS.ServerConfig
 	quicConfig            *quic.Config
-	userMap               map[string]U
+	users                 atomic.Pointer[UserState[U]]
 	udpDisabled           bool
 	udpTimeout            time.Duration
 	handler               ServerHandler
@@ -138,7 +153,6 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		geckoMaxPacketSize:    options.GeckoMaxPacketSize,
 		tlsConfig:             options.TLSConfig,
 		quicConfig:            quicConfig,
-		userMap:               make(map[string]U),
 		udpDisabled:           options.UDPDisabled,
 		udpTimeout:            options.UDPTimeout,
 		handler:               options.Handler,
@@ -149,11 +163,22 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 }
 
 func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
-	userMap := make(map[string]U)
-	for i, user := range userList {
-		userMap[passwordList[i]] = user
+	s.UpdateUserState(NewUserState(userList, passwordList))
+}
+
+// UpdateUserState atomically publishes a prepared authentication snapshot.
+func (s *Service[U]) UpdateUserState(state *UserState[U]) {
+	s.users.Store(state)
+}
+
+func (s *Service[U]) lookupUser(password string) (U, bool) {
+	state := s.users.Load()
+	if state == nil {
+		var user U
+		return user, false
 	}
-	s.userMap = userMap
+	user, loaded := state.userMap[password]
+	return user, loaded
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
@@ -255,81 +280,94 @@ func (s *Service[U]) handleConnection(connection *quic.Conn) {
 	_ = connection.CloseWithError(0, "")
 }
 
+type sessionAuthState[U comparable] struct {
+	user U
+}
+
 type serverSession[U comparable] struct {
 	*Service[U]
-	ctx           context.Context
-	quicConn      *quic.Conn
-	connAccess    sync.Mutex
-	connDone      chan struct{}
-	connErr       error
-	authenticated bool
-	authUser      U
-	udpAccess     sync.RWMutex
-	udpConnMap    map[uint32]*udpPacketConn
+	ctx        context.Context
+	quicConn   *quic.Conn
+	connAccess sync.Mutex
+	connDone   chan struct{}
+	connErr    error
+	authAccess sync.Mutex
+	authState  atomic.Pointer[sessionAuthState[U]]
+	udpAccess  sync.RWMutex
+	udpConnMap map[uint32]*udpPacketConn
 }
 
 func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost && r.Host == protocol.URLHost && r.URL.Path == protocol.URLPath {
-		if s.authenticated {
-			protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
-				UDPEnabled: !s.udpDisabled,
-				Rx:         s.receiveBPS,
-				RxAuto:     s.receiveBPS == 0 && s.ignoreClientBandwidth,
-			})
-			w.WriteHeader(protocol.StatusAuthOK)
-			return
-		}
-		request := protocol.AuthRequestFromHeader(r.Header)
-		user, loaded := s.userMap[request.Auth]
-		if !loaded {
-			s.masqueradeHandler.ServeHTTP(w, r)
-			return
-		}
-		s.authUser = user
-		s.authenticated = true
-		var rxAuto bool
-		if s.receiveBPS > 0 && s.ignoreClientBandwidth && request.Rx == 0 {
-			s.logger.Debug("process connection from ", r.RemoteAddr, ": BBR disabled by server")
-			s.masqueradeHandler.ServeHTTP(w, r)
-			return
-		} else if !(s.receiveBPS == 0 && s.ignoreClientBandwidth) && request.Rx > 0 {
-			rx := request.Rx
-			if s.sendBPS > 0 && rx > s.sendBPS {
-				rx = s.sendBPS
-			}
-			s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(rx, s.quicConn.InitialPacketSize(), s.brutalDebug, s.logger))
-		} else {
-			s.quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
-				s.quicConn.InitialPacketSize(),
-				s.bbrProfile,
-			))
-			rxAuto = true
-		}
-		protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
-			UDPEnabled: !s.udpDisabled,
-			Rx:         s.receiveBPS,
-			RxAuto:     rxAuto,
-		})
-		w.WriteHeader(protocol.StatusAuthOK)
-		if s.ctx.Done() != nil {
-			go func() {
-				select {
-				case <-s.ctx.Done():
-					s.closeWithError(s.ctx.Err())
-				case <-s.connDone:
-				}
-			}()
-		}
-		if !s.udpDisabled {
-			go s.loopMessages()
-		}
-	} else {
+	if r.Method != http.MethodPost || r.Host != protocol.URLHost || r.URL.Path != protocol.URLPath {
 		s.masqueradeHandler.ServeHTTP(w, r)
+		return
+	}
+	if s.authState.Load() != nil {
+		s.writeAuthResponse(w, s.receiveBPS == 0 && s.ignoreClientBandwidth)
+		return
+	}
+	request := protocol.AuthRequestFromHeader(r.Header)
+	user, loaded := s.lookupUser(request.Auth)
+	if !loaded {
+		s.masqueradeHandler.ServeHTTP(w, r)
+		return
+	}
+
+	s.authAccess.Lock()
+	if s.authState.Load() != nil {
+		s.authAccess.Unlock()
+		s.writeAuthResponse(w, s.receiveBPS == 0 && s.ignoreClientBandwidth)
+		return
+	}
+	if s.receiveBPS > 0 && s.ignoreClientBandwidth && request.Rx == 0 {
+		s.authAccess.Unlock()
+		s.logger.Debug("process connection from ", r.RemoteAddr, ": BBR disabled by server")
+		s.masqueradeHandler.ServeHTTP(w, r)
+		return
+	}
+	var rxAuto bool
+	if !(s.receiveBPS == 0 && s.ignoreClientBandwidth) && request.Rx > 0 {
+		rx := request.Rx
+		if s.sendBPS > 0 && rx > s.sendBPS {
+			rx = s.sendBPS
+		}
+		s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(rx, s.quicConn.InitialPacketSize(), s.brutalDebug, s.logger))
+	} else {
+		s.quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
+			s.quicConn.InitialPacketSize(),
+			s.bbrProfile,
+		))
+		rxAuto = true
+	}
+	s.authState.Store(&sessionAuthState[U]{user: user})
+	s.authAccess.Unlock()
+
+	s.writeAuthResponse(w, rxAuto)
+	if s.ctx.Done() != nil {
+		go func() {
+			select {
+			case <-s.ctx.Done():
+				s.closeWithError(s.ctx.Err())
+			case <-s.connDone:
+			}
+		}()
+	}
+	if !s.udpDisabled {
+		go s.loopMessages()
 	}
 }
 
+func (s *serverSession[U]) writeAuthResponse(w http.ResponseWriter, rxAuto bool) {
+	protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{
+		UDPEnabled: !s.udpDisabled,
+		Rx:         s.receiveBPS,
+		RxAuto:     rxAuto,
+	})
+	w.WriteHeader(protocol.StatusAuthOK)
+}
+
 func (s *serverSession[U]) dispatchStream(frameType http3.FrameType, stream *quic.Stream, err error) (bool, error) {
-	if !s.authenticated || err != nil {
+	if s.authState.Load() == nil || err != nil {
 		return false, nil
 	}
 	if frameType != protocol.FrameTypeTCPRequest {
@@ -356,7 +394,11 @@ func (s *serverSession[U]) handleStream(stream *quic.Stream) error {
 	if err != nil {
 		return E.New("read TCP request")
 	}
-	s.handler.NewConnectionEx(auth.ContextWithUser(s.ctx, s.authUser), &serverConn{Stream: stream}, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), M.ParseSocksaddr(destinationString).Unwrap(), nil)
+	authState := s.authState.Load()
+	if authState == nil {
+		return E.New("unauthenticated session")
+	}
+	s.handler.NewConnectionEx(auth.ContextWithUser(s.ctx, authState.user), &serverConn{Stream: stream}, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), M.ParseSocksaddr(destinationString).Unwrap(), nil)
 	return nil
 }
 
