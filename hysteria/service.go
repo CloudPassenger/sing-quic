@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/quic-go"
@@ -49,6 +50,20 @@ type ServerHandler interface {
 	N.UDPConnectionHandlerEx
 }
 
+// UserState is an immutable authentication-to-user snapshot.
+type UserState[U comparable] struct {
+	userMap map[string]U
+}
+
+// NewUserState compiles a complete authentication snapshot without publishing it.
+func NewUserState[U comparable](userList []U, passwordList []string) *UserState[U] {
+	userMap := make(map[string]U, len(userList))
+	for index, user := range userList {
+		userMap[passwordList[index]] = user
+	}
+	return &UserState[U]{userMap: userMap}
+}
+
 type Service[U comparable] struct {
 	ctx           context.Context
 	logger        logger.Logger
@@ -58,7 +73,7 @@ type Service[U comparable] struct {
 	xplusPassword string
 	tlsConfig     aTLS.ServerConfig
 	quicConfig    *quic.Config
-	userMap       map[string]U
+	users         atomic.Pointer[UserState[U]]
 	udpDisabled   bool
 	udpTimeout    time.Duration
 	handler       ServerHandler
@@ -110,7 +125,6 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		xplusPassword: options.XPlusPassword,
 		tlsConfig:     options.TLSConfig,
 		quicConfig:    quicConfig,
-		userMap:       make(map[string]U),
 		handler:       options.Handler,
 		udpDisabled:   options.UDPDisabled,
 		udpTimeout:    options.UDPTimeout,
@@ -118,11 +132,22 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 }
 
 func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
-	userMap := make(map[string]U)
-	for i, user := range userList {
-		userMap[passwordList[i]] = user
+	s.UpdateUserState(NewUserState(userList, passwordList))
+}
+
+// UpdateUserState atomically publishes a prepared authentication snapshot.
+func (s *Service[U]) UpdateUserState(state *UserState[U]) {
+	s.users.Store(state)
+}
+
+func (s *Service[U]) lookupUser(password string) (U, bool) {
+	state := s.users.Load()
+	if state == nil {
+		var user U
+		return user, false
 	}
-	s.userMap = userMap
+	user, loaded := state.userMap[password]
+	return user, loaded
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
@@ -193,13 +218,13 @@ func (s *serverSession[U]) handleConnection() {
 		s.closeWithError0(ErrorCodeProtocolError, E.Cause(err, "read client hello"))
 		return
 	}
-	user, loaded := s.userMap[clientHello.Auth]
+	user, loaded := s.lookupUser(clientHello.Auth)
 	if !loaded {
 		WriteServerHello(controlStream, ServerHello{
 			OK:      false,
 			Message: "Wrong password",
 		})
-		s.closeWithError0(ErrorCodeAuthError, E.New("authentication failed, auth_str=", clientHello.Auth))
+		s.closeWithError0(ErrorCodeAuthError, E.New("authentication failed"))
 		return
 	}
 	err = WriteServerHello(controlStream, ServerHello{

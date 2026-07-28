@@ -9,6 +9,7 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/quic-go"
@@ -22,8 +23,6 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
-
-	"github.com/gofrs/uuid/v5"
 )
 
 type ServiceOptions struct {
@@ -43,14 +42,35 @@ type ServiceHandler interface {
 	N.UDPConnectionHandlerEx
 }
 
+type userRecord[U comparable] struct {
+	user     U
+	password string
+}
+
+// UserState is an immutable UUID, password, and user authentication snapshot.
+type UserState[U comparable] struct {
+	userMap map[[16]byte]userRecord[U]
+}
+
+// NewUserState compiles a complete authentication snapshot without publishing it.
+func NewUserState[U comparable](userList []U, uuidList [][16]byte, passwordList []string) *UserState[U] {
+	userMap := make(map[[16]byte]userRecord[U], len(userList))
+	for index, user := range userList {
+		userMap[uuidList[index]] = userRecord[U]{
+			user:     user,
+			password: passwordList[index],
+		}
+	}
+	return &UserState[U]{userMap: userMap}
+}
+
 type Service[U comparable] struct {
 	ctx               context.Context
 	logger            logger.Logger
 	tlsConfig         aTLS.ServerConfig
 	heartbeat         time.Duration
 	quicConfig        *quic.Config
-	userMap           map[[16]byte]U
-	passwordMap       map[U]string
+	users             atomic.Pointer[UserState[U]]
 	congestionControl string
 	authTimeout       time.Duration
 	udpTimeout        time.Duration
@@ -87,7 +107,6 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		tlsConfig:         options.TLSConfig,
 		heartbeat:         options.Heartbeat,
 		quicConfig:        quicConfig,
-		userMap:           make(map[[16]byte]U),
 		congestionControl: options.CongestionControl,
 		authTimeout:       options.AuthTimeout,
 		udpTimeout:        options.UDPTimeout,
@@ -96,14 +115,22 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 }
 
 func (s *Service[U]) UpdateUsers(userList []U, uuidList [][16]byte, passwordList []string) {
-	userMap := make(map[[16]byte]U)
-	passwordMap := make(map[U]string)
-	for index := range userList {
-		userMap[uuidList[index]] = userList[index]
-		passwordMap[userList[index]] = passwordList[index]
+	s.UpdateUserState(NewUserState(userList, uuidList, passwordList))
+}
+
+// UpdateUserState atomically publishes a prepared authentication snapshot.
+func (s *Service[U]) UpdateUserState(state *UserState[U]) {
+	s.users.Store(state)
+}
+
+func (s *Service[U]) lookupUser(userUUID [16]byte) (U, string, bool) {
+	state := s.users.Load()
+	if state == nil {
+		var user U
+		return user, "", false
 	}
-	s.userMap = userMap
-	s.passwordMap = passwordMap
+	record, loaded := state.userMap[userUUID]
+	return record.user, record.password, loaded
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
@@ -170,6 +197,10 @@ func (s *Service[U]) handleConnection(connection *quic.Conn) {
 	session.handle()
 }
 
+type sessionAuthState[U comparable] struct {
+	user U
+}
+
 type serverSession[U comparable] struct {
 	*Service[U]
 	ctx        context.Context
@@ -178,7 +209,7 @@ type serverSession[U comparable] struct {
 	connDone   chan struct{}
 	connErr    error
 	authDone   chan struct{}
-	authUser   U
+	authState  atomic.Pointer[sessionAuthState[U]]
 	udpAccess  sync.RWMutex
 	udpConnMap map[uint16]*udpPacketConn
 }
@@ -243,19 +274,21 @@ func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
 		}
 		var userUUID [16]byte
 		copy(userUUID[:], buffer.Range(2, 2+16))
-		user, loaded := s.userMap[userUUID]
+		user, password, loaded := s.lookupUser(userUUID)
 		if !loaded {
-			return E.New("authentication: unknown user ", uuid.UUID(userUUID))
+			return E.New("authentication: unknown user")
 		}
 		handshakeState := s.quicConn.ConnectionState()
-		tuicToken, err := handshakeState.TLS.ExportKeyingMaterial(string(userUUID[:]), []byte(s.passwordMap[user]), 32)
+		tuicToken, err := handshakeState.TLS.ExportKeyingMaterial(string(userUUID[:]), []byte(password), 32)
 		if err != nil {
 			return E.Cause(err, "authentication: export keying material")
 		}
 		if !bytes.Equal(tuicToken, buffer.Range(2+16, 2+16+32)) {
 			return E.New("authentication: token mismatch")
 		}
-		s.authUser = user
+		if !s.authState.CompareAndSwap(nil, &sessionAuthState[U]{user: user}) {
+			return E.New("authentication: multiple authentication requests")
+		}
 		close(s.authDone)
 		return nil
 	case CommandPacket:
@@ -358,7 +391,11 @@ func (s *serverSession[U]) handleStream(stream *quic.Stream) error {
 	if !buffer.IsEmpty() {
 		conn = bufio.NewCachedConn(conn, buffer.ToOwned())
 	}
-	s.handler.NewConnectionEx(auth.ContextWithUser(s.ctx, s.authUser), conn, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), destination, nil)
+	authState := s.authState.Load()
+	if authState == nil {
+		return E.New("authentication state unavailable")
+	}
+	s.handler.NewConnectionEx(auth.ContextWithUser(s.ctx, authState.user), conn, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), destination, nil)
 	return nil
 }
 
