@@ -48,13 +48,13 @@ type userRecord[U comparable] struct {
 	password string
 }
 
-// UserState is an immutable UUID, password, and user authentication snapshot.
-type UserState[U comparable] struct {
+// userState is an immutable UUID, password, and user authentication snapshot.
+type userState[U comparable] struct {
 	userMap map[[16]byte]userRecord[U]
 }
 
-// NewUserState compiles a complete authentication snapshot without publishing it.
-func NewUserState[U comparable](userList []U, uuidList [][16]byte, passwordList []string) *UserState[U] {
+// newUserState compiles a complete authentication snapshot without publishing it.
+func newUserState[U comparable](userList []U, uuidList [][16]byte, passwordList []string) *userState[U] {
 	userMap := make(map[[16]byte]userRecord[U], len(userList))
 	for index, user := range userList {
 		userMap[uuidList[index]] = userRecord[U]{
@@ -62,7 +62,7 @@ func NewUserState[U comparable](userList []U, uuidList [][16]byte, passwordList 
 			password: passwordList[index],
 		}
 	}
-	return &UserState[U]{userMap: userMap}
+	return &userState[U]{userMap: userMap}
 }
 
 type Service[U comparable] struct {
@@ -71,7 +71,7 @@ type Service[U comparable] struct {
 	tlsConfig         aTLS.ServerConfig
 	heartbeat         time.Duration
 	quicConfig        *quic.Config
-	users             atomic.Pointer[UserState[U]]
+	users             atomic.Pointer[userState[U]]
 	congestionControl string
 	authTimeout       time.Duration
 	udpTimeout        time.Duration
@@ -116,13 +116,9 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 	}, nil
 }
 
+// UpdateUsers atomically publishes a complete replacement authentication state.
 func (s *Service[U]) UpdateUsers(userList []U, uuidList [][16]byte, passwordList []string) {
-	s.UpdateUserState(NewUserState(userList, uuidList, passwordList))
-}
-
-// UpdateUserState atomically publishes a prepared authentication snapshot.
-func (s *Service[U]) UpdateUserState(state *UserState[U]) {
-	s.users.Store(state)
+	s.users.Store(newUserState(userList, uuidList, passwordList))
 }
 
 func (s *Service[U]) lookupUser(userUUID [16]byte) (U, string, bool) {
