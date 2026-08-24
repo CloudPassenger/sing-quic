@@ -52,18 +52,18 @@ type ServerHandler interface {
 	N.UDPConnectionHandlerEx
 }
 
-// UserState is an immutable password-to-user authentication snapshot.
-type UserState[U comparable] struct {
+// userState is an immutable password-to-user authentication snapshot.
+type userState[U comparable] struct {
 	userMap map[string]U
 }
 
-// NewUserState compiles a complete authentication snapshot without publishing it.
-func NewUserState[U comparable](userList []U, passwordList []string) *UserState[U] {
+// newUserState compiles a complete authentication snapshot without publishing it.
+func newUserState[U comparable](userList []U, passwordList []string) *userState[U] {
 	userMap := make(map[string]U, len(userList))
 	for index, user := range userList {
 		userMap[passwordList[index]] = user
 	}
-	return &UserState[U]{userMap: userMap}
+	return &userState[U]{userMap: userMap}
 }
 
 type Service[U comparable] struct {
@@ -76,7 +76,7 @@ type Service[U comparable] struct {
 	salamanderPassword    string
 	tlsConfig             aTLS.ServerConfig
 	quicConfig            *quic.Config
-	users                 atomic.Pointer[UserState[U]]
+	users                 atomic.Pointer[userState[U]]
 	udpDisabled           bool
 	udpTimeout            time.Duration
 	handler               ServerHandler
@@ -120,13 +120,9 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 	}, nil
 }
 
+// UpdateUsers atomically publishes a complete replacement authentication state.
 func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
-	s.UpdateUserState(NewUserState(userList, passwordList))
-}
-
-// UpdateUserState atomically publishes a prepared authentication snapshot.
-func (s *Service[U]) UpdateUserState(state *UserState[U]) {
-	s.users.Store(state)
+	s.users.Store(newUserState(userList, passwordList))
 }
 
 func (s *Service[U]) lookupUser(password string) (U, bool) {
