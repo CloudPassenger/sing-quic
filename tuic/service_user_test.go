@@ -51,17 +51,21 @@ func TestServiceUpdateUsersAtomicPublication(t *testing.T) {
 	start := make(chan struct{})
 	failures := make(chan error, 1)
 	var waitGroup sync.WaitGroup
-	updateSets := []*UserState[string]{
-		NewUserState(
-			[]string{"alice", ""},
-			[][16]byte{aliceUUID, legacyUUIDA},
-			[]string{"alice-old", "legacy-a"},
-		),
-		NewUserState(
-			[]string{"bob", ""},
-			[][16]byte{bobUUID, legacyUUIDB},
-			[]string{"bob-password", "legacy-b"},
-		),
+	updateSets := []struct {
+		users     []string
+		uuids     [][16]byte
+		passwords []string
+	}{
+		{
+			users:     []string{"alice", ""},
+			uuids:     [][16]byte{aliceUUID, legacyUUIDA},
+			passwords: []string{"alice-old", "legacy-a"},
+		},
+		{
+			users:     []string{"bob", ""},
+			uuids:     [][16]byte{bobUUID, legacyUUIDB},
+			passwords: []string{"bob-password", "legacy-b"},
+		},
 	}
 
 	waitGroup.Add(1)
@@ -69,7 +73,8 @@ func TestServiceUpdateUsersAtomicPublication(t *testing.T) {
 		defer waitGroup.Done()
 		<-start
 		for index := range iterations {
-			service.UpdateUserState(updateSets[index%len(updateSets)])
+			update := updateSets[index%len(updateSets)]
+			service.UpdateUsers(update.users, update.uuids, update.passwords)
 		}
 	}()
 	for range 8 {
